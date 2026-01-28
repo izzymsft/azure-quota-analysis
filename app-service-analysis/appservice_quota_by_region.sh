@@ -2,33 +2,32 @@
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# App Service quota + SKU availability by region (NO provisioning attempts)
+# App Service SKU availability + quota remaining by region (NO provisioning attempts)
 #
 # Usage:
 #   ./appservice_quota_by_region.sh --sku B1
 #   ./appservice_quota_by_region.sh --sku S1 --linux
 #   ./appservice_quota_by_region.sh --sku P1V3 --windows
 #
-# Outputs:
-#   ./appservice_quota_by_region/summary_<SKU>.tsv
-#   ./appservice_quota_by_region/detail_<SKU>.tsv
-#
-# Notes:
-# - SKU availability is based on `az appservice list-locations --sku <SKU>`.
-# - Quota/usage is best-effort via Microsoft.Web locations usages endpoint.
+# Optional env vars:
+#   OUT_DIR=./out
+#   API_VERSION=2025-03-01
+#   PLAN_QUOTA_REGEX='Server Farm|serverfarms|App Service Plan|AppServicePlan'
 # ------------------------------------------------------------------------------
 
 API_VERSION="${API_VERSION:-2025-03-01}"
 OUT_DIR="${OUT_DIR:-./appservice_quota_by_region}"
+PLAN_QUOTA_REGEX="${PLAN_QUOTA_REGEX:-Server Farm|serverfarms|App Service Plan|AppServicePlan}"
+
 mkdir -p "$OUT_DIR"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
 need_cmd az
 need_cmd jq
 
-SKU="${SKU:-}"                 # can be passed via env or --sku
+SKU="${SKU:-}"                 # can be set via env or --sku
 LINUX_WORKERS_ENABLED="0"      # set via --linux
-HYPERV_WORKERS_ENABLED="0"     # set via --windows
+HYPERV_WORKERS_ENABLED="0"     # set via --windows/--hyperv
 
 usage() {
   cat <<EOF
@@ -40,10 +39,10 @@ Examples:
   $0 --sku S1
   $0 --sku P1V3 --windows
 
-Environment variables (optional):
-  API_VERSION   (default: ${API_VERSION})
-  OUT_DIR       (default: ${OUT_DIR})
-  SKU           (alternative to --sku)
+Optional env vars:
+  OUT_DIR            (default: ${OUT_DIR})
+  API_VERSION        (default: ${API_VERSION})
+  PLAN_QUOTA_REGEX   (default: ${PLAN_QUOTA_REGEX})
 
 EOF
 }
@@ -83,15 +82,15 @@ if [[ -z "$SKU" ]]; then
   exit 1
 fi
 
-# Normalize SKU for filenames
 SKU_SAFE="$(echo "$SKU" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9')"
 SUB_ID="$(az account show --query id -o tsv)"
 echo "Using subscription: $SUB_ID"
 echo "Target SKU: $SKU"
+echo "PLAN_QUOTA_REGEX: $PLAN_QUOTA_REGEX"
 if [[ "$LINUX_WORKERS_ENABLED" == "1" ]]; then echo "Worker type: Linux"; fi
 if [[ "$HYPERV_WORKERS_ENABLED" == "1" ]]; then echo "Worker type: Windows/HyperV"; fi
 if [[ "$LINUX_WORKERS_ENABLED" == "0" && "$HYPERV_WORKERS_ENABLED" == "0" ]]; then
-  echo "Worker type: Not specified (Azure will return general SKU availability)"
+  echo "Worker type: Not specified (general SKU availability)"
 fi
 
 # Regions available to the subscription
@@ -112,7 +111,10 @@ comm -12 "$OUT_DIR/sub_regions.txt" "$OUT_DIR/sku_regions.txt" > "$OUT_DIR/candi
 SUMMARY_TSV="$OUT_DIR/summary_${SKU_SAFE}.tsv"
 DETAIL_TSV="$OUT_DIR/detail_${SKU_SAFE}.tsv"
 
-echo -e "region\tsku_available_in_region\tquota_api_status\tquota_item_count" > "$SUMMARY_TSV"
+# Summary shows "how much quota is available" in each region:
+# - plan_remaining: remaining quota for the best-matching plan/serverfarm metric (if present)
+# - min_remaining/min_metric: the tightest quota counter in that region (remaining smallest)
+echo -e "region\tsku_available\tquota_api_status\tlimited_metrics\tplan_remaining\tmin_remaining\tmin_metric" > "$SUMMARY_TSV"
 echo -e "region\tquota_metric\tcurrent\tlimit\tremaining\tunit\tnextResetTime" > "$DETAIL_TSV"
 
 echo
@@ -124,7 +126,7 @@ else
 fi
 echo
 
-# Minimal URL encode helper (region names usually don't need it, but safe)
+# Minimal URL encode helper (region names typically do not need it, but safe)
 urlencode() {
   python3 - <<PY
 import urllib.parse
@@ -141,25 +143,72 @@ while read -r region; do
 
   quota_json="$OUT_DIR/usages_${region}_${SKU_SAFE}.json"
   if az rest --method get --url "$url" -o json > "$quota_json" 2>/dev/null; then
-    item_count="$(jq -r '.value | length' "$quota_json" 2>/dev/null || echo 0)"
-    echo -e "${region}\ttrue\tok\t${item_count}" >> "$SUMMARY_TSV"
+    # Build a normalized list of metrics with non-zero limits (these represent actual quota ceilings)
+    # Then compute:
+    #   limited_metrics count
+    #   plan_remaining: min remaining among "plan-ish" metrics matched by PLAN_QUOTA_REGEX
+    #   min_remaining + min_metric: most constraining quota counter overall
+    summary_line="$(
+      jq -r --arg region "$region" --arg planre "$PLAN_QUOTA_REGEX" '
+        def metric_name: (.name.value // .name.localizedValue // "unknown");
+        def current: (.currentValue // 0);
+        def limit:   (.limit // 0);
+        def remaining: (limit - current);
 
+        [ (.value // [])
+          | .[]
+          | select(limit > 0)
+          | { name: metric_name, remaining: remaining }
+        ] as $m
+        | ($m | length) as $cnt
+        | (
+            $m
+            | map(select(.name | test($planre; "i")))
+            | sort_by(.remaining)
+            | (if length > 0 then .[0].remaining else "" end)
+          ) as $plan_remaining
+        | (
+            $m
+            | sort_by(.remaining)
+            | (if length > 0 then .[0] else {remaining:"", name:""} end)
+          ) as $min
+        | [
+            $region,
+            "true",
+            "ok",
+            ($cnt|tostring),
+            ($plan_remaining|tostring),
+            ($min.remaining|tostring),
+            ($min.name|tostring)
+          ]
+        | @tsv
+      ' "$quota_json"
+    )"
+    echo -e "$summary_line" >> "$SUMMARY_TSV"
+
+    # Detail rows: every metric with remaining computed
     jq -r --arg region "$region" '
+      def metric_name: (.name.value // .name.localizedValue // "unknown");
+      def current: (.currentValue // 0);
+      def limit:   (.limit // 0);
+      def remaining: (limit - current);
+
       (.value // [])
       | .[]
       | [
           $region,
-          (.name.value // .name.localizedValue // "unknown"),
-          (.currentValue // 0),
-          (.limit // 0),
-          ((.limit // 0) - (.currentValue // 0)),
+          metric_name,
+          current,
+          limit,
+          remaining,
           (.unit // ""),
           (.nextResetTime // "")
         ]
       | @tsv
     ' "$quota_json" >> "$DETAIL_TSV"
+
   else
-    echo -e "${region}\ttrue\tunavailable\t0" >> "$SUMMARY_TSV"
+    echo -e "${region}\ttrue\tunavailable\t0\t\t\t" >> "$SUMMARY_TSV"
   fi
 done < "$OUT_DIR/candidate_regions_${SKU_SAFE}.txt"
 
@@ -168,8 +217,10 @@ echo "Done."
 echo "Summary: $SUMMARY_TSV"
 echo "Detail:  $DETAIL_TSV"
 echo
-echo "Tip: show quota rows with a meaningful limit (>0) sorted by remaining:"
-awk -F'\t' 'NR>1 && $4 ~ /^[0-9]+$/ && $4>0 {print $0}' "$DETAIL_TSV" \
-  | sort -t$'\t' -k5,5nr \
-  | head -n 20 \
-  | column -t -s $'\t'
+
+echo "Summary table (quota remaining by region):"
+column -t -s $'\t' "$SUMMARY_TSV" | sed 's/^/  /'
+
+echo
+echo "Tip: show only regions with a numeric plan_remaining (best proxy metric):"
+awk -F'\t' 'NR==1 || $5 ~ /^[0-9-]+$/' "$SUMMARY_TSV" | column -t -s $'\t'
