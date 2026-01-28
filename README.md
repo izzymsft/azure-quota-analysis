@@ -37,4 +37,10 @@ appservice_quota_by_region.sh --sku {TARGET_SKU}
 
 ./appservice_quota_by_region.sh --sku B1
 
+./appservice_quota_by_region.sh --sku BI --linux
+
+./appservice_quota_by_region.sh --sku S1 --linux
+
+./appservice_quota_by_region.sh --sku S1 --windows
+
 ```
